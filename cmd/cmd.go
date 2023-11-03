@@ -159,7 +159,49 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	return RunGenerate(cmd, args)
+	interactive := true
+
+	opts := runOptions{
+		Model:    name,
+		WordWrap: os.Getenv("TERM") == "xterm-256color",
+		Options:  map[string]interface{}{},
+	}
+
+	format, err := cmd.Flags().GetString("format")
+	if err != nil {
+		return err
+	}
+	opts.Format = format
+
+	prompts := args[1:]
+
+	// prepend stdin to the prompt if provided
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		in, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+
+		prompts = append([]string{string(in)}, prompts...)
+		opts.WordWrap = false
+		interactive = false
+	}
+	opts.Prompt = strings.Join(prompts, " ")
+	if len(prompts) > 0 {
+		interactive = false
+	}
+
+	nowrap, err := cmd.Flags().GetBool("nowordwrap")
+	if err != nil {
+		return err
+	}
+	opts.WordWrap = !nowrap
+
+	if !interactive {
+		return generate(cmd, opts)
+	}
+
+	return chatInteractive(cmd, opts)
 }
 
 func PushHandler(cmd *cobra.Command, args []string) error {
@@ -414,7 +456,7 @@ func PullHandler(cmd *cobra.Command, args []string) error {
 func RunGenerate(cmd *cobra.Command, args []string) error {
 	interactive := true
 
-	opts := generateOptions{
+	opts := runOptions{
 		Model:    args[0],
 		WordWrap: os.Getenv("TERM") == "xterm-256color",
 		Options:  map[string]interface{}{},
@@ -454,101 +496,111 @@ func RunGenerate(cmd *cobra.Command, args []string) error {
 		return generate(cmd, opts)
 	}
 
-	return generateInteractive(cmd, opts)
+	return chatInteractive(cmd, opts)
 }
 
-type generateContextKey string
+func showProgress() *progress.Progress {
+	p := progress.NewProgress(os.Stderr)
+	spinner := progress.NewSpinner("")
+	p.Add("", spinner)
+	return p
+}
 
-type generateOptions struct {
+func setupCancellation() (context.Context, func(), *bool) {
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	abort := new(bool)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT)
+
+	go func() {
+		<-sigChan
+		cancel()
+		*abort = true
+	}()
+
+	return cancelCtx, cancel, abort
+}
+
+func applyWordWrap(content, wordBuffer string, termWidth, currentLineLength int) {
+	for _, ch := range content {
+		if currentLineLength+1 > termWidth-5 {
+			// backtrack the length of the last word and clear to the end of the line
+			fmt.Printf("\x1b[%dD\x1b[K\n", len(wordBuffer))
+			fmt.Printf("%s%c", wordBuffer, ch)
+			currentLineLength = len(wordBuffer) + 1
+		} else {
+			fmt.Print(string(ch))
+			currentLineLength += 1
+
+			switch ch {
+			case ' ':
+				wordBuffer = ""
+			case '\n':
+				currentLineLength = 0
+			default:
+				wordBuffer += string(ch)
+			}
+		}
+	}
+}
+
+type runOptions struct {
 	Model    string
 	Prompt   string
+	Messages []api.Message
 	WordWrap bool
 	Format   string
 	Options  map[string]interface{}
 }
 
-func generate(cmd *cobra.Command, opts generateOptions) error {
+func generate(cmd *cobra.Command, opts runOptions) error {
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
 		return err
 	}
 
-	p := progress.NewProgress(os.Stderr)
+	p := showProgress()
 	defer p.StopAndClear()
-
-	spinner := progress.NewSpinner("")
-	p.Add("", spinner)
-
-	var latest api.GenerateResponse
-
-	generateContext, ok := cmd.Context().Value(generateContextKey("context")).([]int)
-	if !ok {
-		generateContext = []int{}
-	}
 
 	termWidth, _, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
 		opts.WordWrap = false
 	}
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancelCtx, cancel, abort := setupCancellation()
 	defer cancel()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT)
-	var abort bool
-
-	go func() {
-		<-sigChan
-		cancel()
-		abort = true
-	}()
 
 	var currentLineLength int
 	var wordBuffer string
+	var latest api.PredictResponse
 
-	request := api.GenerateRequest{
-		Model:   opts.Model,
-		Prompt:  opts.Prompt,
-		Context: generateContext,
-		Format:  opts.Format,
-		Options: opts.Options,
-	}
-	fn := func(response api.GenerateResponse) error {
+	fn := func(response api.PredictResponse) error {
 		p.StopAndClear()
-
 		latest = response
+		if response.Response == "" {
+			// warm-up response or done
+			return nil
+		}
+		content := response.Response
 
 		if opts.WordWrap {
-			for _, ch := range response.Response {
-				if currentLineLength+1 > termWidth-5 {
-					// backtrack the length of the last word and clear to the end of the line
-					fmt.Printf("\x1b[%dD\x1b[K\n", len(wordBuffer))
-					fmt.Printf("%s%c", wordBuffer, ch)
-					currentLineLength = len(wordBuffer) + 1
-				} else {
-					fmt.Print(string(ch))
-					currentLineLength += 1
-
-					switch ch {
-					case ' ':
-						wordBuffer = ""
-					case '\n':
-						currentLineLength = 0
-					default:
-						wordBuffer += string(ch)
-					}
-				}
-			}
+			applyWordWrap(content, wordBuffer, termWidth, currentLineLength)
 		} else {
-			fmt.Print(response.Response)
+			fmt.Print(content)
 		}
 
 		return nil
 	}
 
-	if err := client.Generate(cancelCtx, &request, fn); err != nil {
-		if strings.Contains(err.Error(), "context canceled") && abort {
+	req := &api.GenerateRequest{
+		Model:   opts.Model,
+		Prompt:  opts.Prompt,
+		Format:  opts.Format,
+		Options: opts.Options,
+	}
+	if err := client.Generate(cancelCtx, req, fn); err != nil {
+		if strings.Contains(err.Error(), "context canceled") && *abort {
 			return nil
 		}
 		return err
@@ -559,7 +611,7 @@ func generate(cmd *cobra.Command, opts generateOptions) error {
 	}
 
 	if !latest.Done {
-		if abort {
+		if *abort {
 			return nil
 		}
 		return errors.New("unexpected end of response")
@@ -574,20 +626,93 @@ func generate(cmd *cobra.Command, opts generateOptions) error {
 		latest.Summary()
 	}
 
-	ctx := cmd.Context()
-	ctx = context.WithValue(ctx, generateContextKey("context"), latest.Context)
-	cmd.SetContext(ctx)
-
 	return nil
 }
 
-func generateInteractive(cmd *cobra.Command, opts generateOptions) error {
-	// load the model
-	loadOpts := generateOptions{
-		Model:  opts.Model,
-		Prompt: "",
+func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
+	client, err := api.ClientFromEnvironment()
+	if err != nil {
+		return nil, err
 	}
-	if err := generate(cmd, loadOpts); err != nil {
+
+	p := showProgress()
+	defer p.StopAndClear()
+
+	termWidth, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		opts.WordWrap = false
+	}
+
+	cancelCtx, cancel, abort := setupCancellation()
+	defer cancel()
+
+	var currentLineLength int
+	var wordBuffer string
+	var latest api.PredictResponse
+	var fullResponse strings.Builder
+	var role string
+
+	fn := func(response api.PredictResponse) error {
+		p.StopAndClear()
+		latest = response
+		if response.Message == nil {
+			// warm-up response or done
+			return nil
+		}
+		role = response.Message.Role
+		content := response.Message.Content
+		fullResponse.WriteString(content)
+
+		if opts.WordWrap {
+			applyWordWrap(content, wordBuffer, termWidth, currentLineLength)
+		} else {
+			fmt.Print(content)
+		}
+
+		return nil
+	}
+
+	req := &api.ChatRequest{
+		Model:    opts.Model,
+		Messages: opts.Messages,
+		Format:   opts.Format,
+		Options:  opts.Options,
+	}
+	if err := client.Chat(cancelCtx, req, fn); err != nil {
+		if strings.Contains(err.Error(), "context canceled") && *abort {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if len(opts.Messages) > 0 {
+		fmt.Println()
+		fmt.Println()
+	}
+
+	if !latest.Done {
+		if *abort {
+			return nil, nil
+		}
+		return nil, errors.New("unexpected end of response")
+	}
+
+	verbose, err := cmd.Flags().GetBool("verbose")
+	if err != nil {
+		return nil, err
+	}
+
+	if verbose {
+		latest.Summary()
+	}
+
+	return &api.Message{Role: role, Content: fullResponse.String()}, nil
+}
+
+func chatInteractive(cmd *cobra.Command, opts runOptions) error {
+	// load the model
+	loadOpts := runOptions{Model: opts.Model}
+	if _, err := chat(cmd, loadOpts); err != nil {
 		return err
 	}
 
@@ -655,7 +780,8 @@ func generateInteractive(cmd *cobra.Command, opts generateOptions) error {
 	fmt.Print(readline.StartBracketedPaste)
 	defer fmt.Printf(readline.EndBracketedPaste)
 
-	var prompt string
+	var msg string
+	messages := make([]api.Message, 0)
 
 	for {
 		line, err := scanner.Readline()
@@ -669,7 +795,7 @@ func generateInteractive(cmd *cobra.Command, opts generateOptions) error {
 			}
 
 			scanner.Prompt.UseAlt = false
-			prompt = ""
+			msg = ""
 
 			continue
 		case err != nil:
@@ -677,24 +803,24 @@ func generateInteractive(cmd *cobra.Command, opts generateOptions) error {
 		}
 
 		switch {
-		case strings.HasPrefix(prompt, `"""`):
+		case strings.HasPrefix(msg, `"""`):
 			// if the prompt so far starts with """ then we're in multiline mode
 			// and we need to keep reading until we find a line that ends with """
 			cut, found := strings.CutSuffix(line, `"""`)
-			prompt += cut + "\n"
+			msg += cut + "\n"
 
 			if !found {
 				continue
 			}
 
-			prompt = strings.TrimPrefix(prompt, `"""`)
+			msg = strings.TrimPrefix(msg, `"""`)
 			scanner.Prompt.UseAlt = false
-		case strings.HasPrefix(line, `"""`) && len(prompt) == 0:
+		case strings.HasPrefix(line, `"""`) && len(msg) == 0:
 			scanner.Prompt.UseAlt = true
-			prompt += line + "\n"
+			msg += line + "\n"
 			continue
 		case scanner.Pasting:
-			prompt += line + "\n"
+			msg += line + "\n"
 			continue
 		case strings.HasPrefix(line, "/list"):
 			args := strings.Fields(line)
@@ -827,16 +953,16 @@ func generateInteractive(cmd *cobra.Command, opts generateOptions) error {
 			fmt.Printf("Unknown command '%s'. Type /? for help\n", args[0])
 			continue
 		default:
-			prompt += line
+			msg += line
 		}
 
-		if len(prompt) > 0 && prompt[0] != '/' {
-			opts.Prompt = prompt
-			if err := generate(cmd, opts); err != nil {
+		if len(line) > 0 && line[0] != '/' {
+			opts.Messages = append(opts.Messages, api.Message{Role: "user", Content: msg})
+			assistant, err := chat(cmd, opts)
+			if err != nil {
 				return err
 			}
-
-			prompt = ""
+			messages = append(messages, *assistant)
 		}
 	}
 }
