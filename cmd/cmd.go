@@ -781,7 +781,7 @@ func chatInteractive(cmd *cobra.Command, opts runOptions) error {
 	defer fmt.Printf(readline.EndBracketedPaste)
 
 	var msg string
-	messages := make([]api.Message, 0)
+	opts.Messages = make([]api.Message, 0)
 
 	for {
 		line, err := scanner.Readline()
@@ -962,7 +962,7 @@ func chatInteractive(cmd *cobra.Command, opts runOptions) error {
 			if err != nil {
 				return err
 			}
-			messages = append(messages, *assistant)
+			opts.Messages = append(opts.Messages, *assistant)
 		}
 	}
 }
